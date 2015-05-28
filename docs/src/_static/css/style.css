@@ -381,6 +381,7 @@ ul.reference li {
     background: url('../images/references/logo_roistr.png') top center no-repeat;
     padding-top: 100px;
     padding-bottom: 24px;
+    background-position-y: 15px;
 }
 
 .reference3 {
@@ -430,6 +431,24 @@ ul.reference li {
     background: url('../images/references/logo_dtu.gif') top center no-repeat;
     background-size: 25%;
     padding-top: 100px;
+    padding-bottom: 24px;
+}
+
+.reference8 {
+    display: inline-block;
+    width: 247px;
+    background: url('../images/references/logo_issuu.jpeg') top center no-repeat;
+    padding-top: 100px;
+    padding-bottom: 24px;
+}
+
+.reference9 {
+    display: inline-block;
+    width: 247px;
+    background: url('../images/references/logo_tailwind.png') top center no-repeat;
+    background-size: 95%;
+    padding-top: 100px;
+    background-position: 0 -20px;
     padding-bottom: 24px;
 }
 
@@ -598,6 +617,14 @@ a.googlegroups{
     padding-top: 53px;
 }
 
+.consulting-banner {
+    background-color: #ff2010;
+    background-color: rgba(255, 32, 16, 0.2);
+    padding: 1px 10px;
+    -moz-border-radius: 15px;
+    border-radius: 15px;
+    line-height: 0.8em;
+}
 
 /* copied from sphinx themes */
 
@@ -732,6 +759,7 @@ pre {
     border: 1px solid #ccc;
     background-color: #f8f8f8;
     line-height: 120%;
+    overflow-x: auto;
 }
 
 tt {

@@ -16,9 +16,11 @@ import os.path
 import tempfile
 
 import numpy
+import scipy.linalg
 
 from gensim.corpora import mmcorpus, Dictionary
-from gensim.models import lsimodel, ldamodel, tfidfmodel, rpmodel, logentropy_model
+from gensim.models import lsimodel, ldamodel, tfidfmodel, rpmodel, logentropy_model, ldamulticore
+from gensim.models.wrappers import ldamallet
 from gensim import matutils
 
 
@@ -55,7 +57,7 @@ class TestLsiModel(unittest.TestCase):
         model = lsimodel.LsiModel(self.corpus, num_topics=2)
 
         # make sure the decomposition is enough accurate
-        u, s, vt = numpy.linalg.svd(matutils.corpus2dense(self.corpus, self.corpus.num_terms), full_matrices=False)
+        u, s, vt = scipy.linalg.svd(matutils.corpus2dense(self.corpus, self.corpus.num_terms), full_matrices=False)
         self.assertTrue(numpy.allclose(s[:2], model.projection.s)) # singular values must match
 
         # transform one document
@@ -120,14 +122,58 @@ class TestLsiModel(unittest.TestCase):
 
 
     def testPersistence(self):
+        fname = testfile()
         model = lsimodel.LsiModel(self.corpus, num_topics=2)
-        model.save(testfile())
-        model2 = lsimodel.LsiModel.load(testfile())
+        model.save(fname)
+        model2 = lsimodel.LsiModel.load(fname)
         self.assertEqual(model.num_topics, model2.num_topics)
         self.assertTrue(numpy.allclose(model.projection.u, model2.projection.u))
         self.assertTrue(numpy.allclose(model.projection.s, model2.projection.s))
         tstvec = []
         self.assertTrue(numpy.allclose(model[tstvec], model2[tstvec])) # try projecting an empty vector
+
+    def testPersistenceCompressed(self):
+        fname = testfile() + '.gz'
+        model = lsimodel.LsiModel(self.corpus, num_topics=2)
+        model.save(fname)
+        model2 = lsimodel.LsiModel.load(fname, mmap=None)
+        self.assertEqual(model.num_topics, model2.num_topics)
+        self.assertTrue(numpy.allclose(model.projection.u, model2.projection.u))
+        self.assertTrue(numpy.allclose(model.projection.s, model2.projection.s))
+        tstvec = []
+        self.assertTrue(numpy.allclose(model[tstvec], model2[tstvec])) # try projecting an empty vector
+
+    def testLargeMmap(self):
+        fname = testfile()
+        model = lsimodel.LsiModel(self.corpus, num_topics=2)
+
+        # test storing the internal arrays into separate files
+        model.save(fname, sep_limit=0)
+
+        # now load the external arrays via mmap
+        model2 = lsimodel.LsiModel.load(fname, mmap='r')
+        self.assertEqual(model.num_topics, model2.num_topics)
+        self.assertTrue(isinstance(model2.projection.u, numpy.memmap))
+        self.assertTrue(isinstance(model2.projection.s, numpy.memmap))
+        self.assertTrue(numpy.allclose(model.projection.u, model2.projection.u))
+        self.assertTrue(numpy.allclose(model.projection.s, model2.projection.s))
+        tstvec = []
+        self.assertTrue(numpy.allclose(model[tstvec], model2[tstvec])) # try projecting an empty vector
+
+    def testLargeMmapCompressed(self):
+        fname = testfile() + '.gz'
+        model = lsimodel.LsiModel(self.corpus, num_topics=2)
+
+        # test storing the internal arrays into separate files
+        model.save(fname, sep_limit=0)
+
+        # now load the external arrays via mmap
+        return
+
+        # turns out this test doesn't exercise this because there are no arrays
+        # to be mmaped!
+        self.assertRaises(IOError, lsimodel.LsiModel.load, fname, mmap='r')
+
 #endclass TestLsiModel
 
 
@@ -150,9 +196,20 @@ class TestRpModel(unittest.TestCase):
 
 
     def testPersistence(self):
+        fname = testfile()
         model = rpmodel.RpModel(self.corpus, num_topics=2)
-        model.save(testfile())
-        model2 = rpmodel.RpModel.load(testfile())
+        model.save(fname)
+        model2 = rpmodel.RpModel.load(fname)
+        self.assertEqual(model.num_topics, model2.num_topics)
+        self.assertTrue(numpy.allclose(model.projection, model2.projection))
+        tstvec = []
+        self.assertTrue(numpy.allclose(model[tstvec], model2[tstvec])) # try projecting an empty vector
+
+    def testPersistenceCompressed(self):
+        fname = testfile() + '.gz'
+        model = rpmodel.RpModel(self.corpus, num_topics=2)
+        model.save(fname)
+        model2 = rpmodel.RpModel.load(fname, mmap=None)
         self.assertEqual(model.num_topics, model2.num_topics)
         self.assertTrue(numpy.allclose(model.projection, model2.projection))
         tstvec = []
@@ -169,7 +226,7 @@ class TestLdaModel(unittest.TestCase):
         # sometimes, LDA training gets stuck at a local minimum
         # in that case try re-training the model from scratch, hoping for a
         # better random initialization
-        for i in xrange(5): # restart at most 5 times
+        for i in range(5): # restart at most 5 times
             # create the transformation model
             model = ldamodel.LdaModel(id2word=dictionary, num_topics=2, passes=100)
             model.update(corpus)
@@ -187,16 +244,277 @@ class TestLdaModel(unittest.TestCase):
                             (i, sorted(vec), sorted(expected)))
         self.assertTrue(passed)
 
+    def testTopicSeeding(self):
+        passed = False
+        for topic in range(2):
+            # try seeding it both ways round, check you get the same
+            # topics out but with which way round they are depending
+            # on the way round they're seeded
+            for i in range(5): # restart at most 5 times
+
+                eta = numpy.ones((2, len(dictionary))) * 0.5
+                system = dictionary.token2id[u'system']
+                trees = dictionary.token2id[u'trees']
+
+                # aggressively seed the word 'system', in one of the
+                # two topics, 10 times higher than the other words
+                eta[topic, system] *= 10
+
+                model = ldamodel.LdaModel(id2word=dictionary, num_topics=2, passes=200, eta=eta)
+                model.update(corpus)
+
+                topics = [dict((word, p) for p, word in model.show_topic(j)) for j in range(2)]
+
+                # check that the word system in the topic we seeded, got a high weight,
+                # and the word 'trees' (the main word in the other topic) a low weight --
+                # and vice versa for the other topic (which we didn't seed with 'system')
+                result = [[topics[topic].get(u'system',0), topics[topic].get(u'trees',0)],
+                          [topics[1-topic].get(u'system',0), topics[1-topic].get(u'trees',0)]]
+                expected = [[0.385, 0.022],
+                            [0.025, 0.157]]
+                passed = numpy.allclose(result, expected, atol=1e-2)
+                if passed:
+                    break
+                logging.warning("LDA failed to converge on attempt %i (got %s, expected %s)" %
+                                (i, result, expected))
+            self.assertTrue(passed)
 
     def testPersistence(self):
+        fname = testfile()
         model = ldamodel.LdaModel(self.corpus, num_topics=2)
-        model.save(testfile())
-        model2 = ldamodel.LdaModel.load(testfile())
+        model.save(fname)
+        model2 = ldamodel.LdaModel.load(fname)
         self.assertEqual(model.num_topics, model2.num_topics)
         self.assertTrue(numpy.allclose(model.expElogbeta, model2.expElogbeta))
         tstvec = []
         self.assertTrue(numpy.allclose(model[tstvec], model2[tstvec])) # try projecting an empty vector
+
+    def testPersistenceCompressed(self):
+        fname = testfile() + '.gz'
+        model = ldamodel.LdaModel(self.corpus, num_topics=2)
+        model.save(fname)
+        model2 = ldamodel.LdaModel.load(fname, mmap=None)
+        self.assertEqual(model.num_topics, model2.num_topics)
+        self.assertTrue(numpy.allclose(model.expElogbeta, model2.expElogbeta))
+        tstvec = []
+        self.assertTrue(numpy.allclose(model[tstvec], model2[tstvec])) # try projecting an empty vector
+
+    def testLargeMmap(self):
+        fname = testfile()
+        model = ldamodel.LdaModel(self.corpus, num_topics=2)
+
+        # simulate storing large arrays separately
+        model.save(testfile(), sep_limit=0)
+
+        # test loading the large model arrays with mmap
+        model2 = ldamodel.LdaModel.load(testfile(), mmap='r')
+        self.assertEqual(model.num_topics, model2.num_topics)
+        self.assertTrue(isinstance(model2.expElogbeta, numpy.memmap))
+        self.assertTrue(numpy.allclose(model.expElogbeta, model2.expElogbeta))
+        tstvec = []
+        self.assertTrue(numpy.allclose(model[tstvec], model2[tstvec])) # try projecting an empty vector
+
+    def testLargeMmapCompressed(self):
+        fname = testfile() + '.gz'
+        model = ldamodel.LdaModel(self.corpus, num_topics=2)
+
+        # simulate storing large arrays separately
+        model.save(fname, sep_limit=0)
+
+        # test loading the large model arrays with mmap
+        self.assertRaises(IOError, ldamodel.LdaModel.load, fname, mmap='r')
 #endclass TestLdaModel
+
+
+class TestLdaMulticore(unittest.TestCase):
+    def setUp(self):
+        self.corpus = mmcorpus.MmCorpus(datapath('testcorpus.mm'))
+
+    def testTransform(self):
+        passed = False
+        # sometimes, LDA training gets stuck at a local minimum
+        # in that case try re-training the model from scratch, hoping for a
+        # better random initialization
+        for i in range(5): # restart at most 5 times
+            # create the transformation model
+            model = ldamulticore.LdaMulticore(id2word=dictionary, num_topics=2, passes=100)
+            model.update(corpus)
+
+            # transform one document
+            doc = list(corpus)[0]
+            transformed = model[doc]
+
+            vec = matutils.sparse2full(transformed, 2) # convert to dense vector, for easier equality tests
+            expected = [0.13, 0.87]
+            passed = numpy.allclose(sorted(vec), sorted(expected), atol=1e-2) # must contain the same values, up to re-ordering
+            if passed:
+                break
+            logging.warning("LDA failed to converge on attempt %i (got %s, expected %s)" %
+                            (i, sorted(vec), sorted(expected)))
+        self.assertTrue(passed)
+
+    def testTopicSeeding(self):
+        passed = False
+        for topic in range(2):
+            # try seeding it both ways round, check you get the same
+            # topics out but with which way round they are depending
+            # on the way round they're seeded
+            for i in range(5): # restart at most 5 times
+
+                eta = numpy.ones((2, len(dictionary))) * 0.5
+                system = dictionary.token2id[u'system']
+
+                # aggressively seed the word 'system', in one of the
+                # two topics, 10 times higher than the other words
+                eta[topic, system] *= 10
+
+                model = ldamulticore.LdaMulticore(id2word=dictionary, num_topics=2, passes=200, eta=eta)
+                model.update(corpus)
+
+                topics = [dict((word, p) for p, word in model.show_topic(j)) for j in range(2)]
+
+                # check that the word system in the topic we seeded, got a high weight,
+                # and the word 'trees' (the main word in the other topic) a low weight --
+                # and vice versa for the other topic (which we didn't seed with 'system')
+                result = [[topics[topic].get(u'system',0), topics[topic].get(u'trees',0)],
+                          [topics[1-topic].get(u'system',0), topics[1-topic].get(u'trees',0)]]
+                expected = [[0.385, 0.022],
+                            [0.025, 0.157]]
+                passed = numpy.allclose(result, expected, atol=1e-2)
+                if passed:
+                    break
+                logging.warning("LDA failed to converge on attempt %i (got %s, expected %s)" %
+                                (i, result, expected))
+            self.assertTrue(passed)
+
+    def testPersistence(self):
+        fname = testfile()
+        model = ldamulticore.LdaMulticore(self.corpus, num_topics=2)
+        model.save(fname)
+        model2 = ldamulticore.LdaMulticore.load(fname)
+        self.assertEqual(model.num_topics, model2.num_topics)
+        self.assertTrue(numpy.allclose(model.expElogbeta, model2.expElogbeta))
+        tstvec = []
+        self.assertTrue(numpy.allclose(model[tstvec], model2[tstvec])) # try projecting an empty vector
+
+    def testPersistenceCompressed(self):
+        fname = testfile() + '.gz'
+        model = ldamulticore.LdaMulticore(self.corpus, num_topics=2)
+        model.save(fname)
+        model2 = ldamulticore.LdaMulticore.load(fname, mmap=None)
+        self.assertEqual(model.num_topics, model2.num_topics)
+        self.assertTrue(numpy.allclose(model.expElogbeta, model2.expElogbeta))
+        tstvec = []
+        self.assertTrue(numpy.allclose(model[tstvec], model2[tstvec])) # try projecting an empty vector
+
+    def testLargeMmap(self):
+        fname = testfile()
+        model = ldamulticore.LdaMulticore(self.corpus, num_topics=2)
+
+        # simulate storing large arrays separately
+        model.save(testfile(), sep_limit=0)
+
+        # test loading the large model arrays with mmap
+        model2 = ldamulticore.LdaModel.load(testfile(), mmap='r')
+        self.assertEqual(model.num_topics, model2.num_topics)
+        self.assertTrue(isinstance(model2.expElogbeta, numpy.memmap))
+        self.assertTrue(numpy.allclose(model.expElogbeta, model2.expElogbeta))
+        tstvec = []
+        self.assertTrue(numpy.allclose(model[tstvec], model2[tstvec])) # try projecting an empty vector
+
+    def testLargeMmapCompressed(self):
+        fname = testfile() + '.gz'
+        model = ldamulticore.LdaMulticore(self.corpus, num_topics=2)
+
+        # simulate storing large arrays separately
+        model.save(fname, sep_limit=0)
+
+        # test loading the large model arrays with mmap
+        self.assertRaises(IOError, ldamulticore.LdaModel.load, fname, mmap='r')
+#endclass TestLdaMulticore
+
+
+class TestLdaMallet(unittest.TestCase):
+    def setUp(self):
+        self.corpus = mmcorpus.MmCorpus(datapath('testcorpus.mm'))
+        mallet_home = os.environ.get('MALLET_HOME', None)
+        self.mallet_path = os.path.join(mallet_home, 'bin', 'mallet') if mallet_home else None
+
+    def testTransform(self):
+        if not self.mallet_path:
+            return
+        passed = False
+        for i in range(5): # restart at most 5 times
+            # create the transformation model
+            model = ldamallet.LdaMallet(self.mallet_path, corpus, id2word=dictionary, num_topics=2, iterations=200)
+
+            # transform one document
+            doc = list(corpus)[0]
+            transformed = model[doc]
+
+            vec = matutils.sparse2full(transformed, 2) # convert to dense vector, for easier equality tests
+            expected = [0.49, 0.51]
+            passed = numpy.allclose(sorted(vec), sorted(expected), atol=1e-2) # must contain the same values, up to re-ordering
+            if passed:
+                break
+            logging.warning("LDA failed to converge on attempt %i (got %s, expected %s)" %
+                            (i, sorted(vec), sorted(expected)))
+        self.assertTrue(passed)
+
+
+    def testPersistence(self):
+        if not self.mallet_path:
+            return
+        fname = testfile()
+        model = ldamallet.LdaMallet(self.mallet_path, self.corpus, num_topics=2, iterations=100)
+        model.save(fname)
+        model2 = ldamallet.LdaMallet.load(fname)
+        self.assertEqual(model.num_topics, model2.num_topics)
+        self.assertTrue(numpy.allclose(model.wordtopics, model2.wordtopics))
+        tstvec = []
+        self.assertTrue(numpy.allclose(model[tstvec], model2[tstvec])) # try projecting an empty vector
+
+    def testPersistenceCompressed(self):
+        if not self.mallet_path:
+            return
+        fname = testfile() + '.gz'
+        model = ldamallet.LdaMallet(self.mallet_path, self.corpus, num_topics=2, iterations=100)
+        model.save(fname)
+        model2 = ldamallet.LdaMallet.load(fname, mmap=None)
+        self.assertEqual(model.num_topics, model2.num_topics)
+        self.assertTrue(numpy.allclose(model.wordtopics, model2.wordtopics))
+        tstvec = []
+        self.assertTrue(numpy.allclose(model[tstvec], model2[tstvec])) # try projecting an empty vector
+
+    def testLargeMmap(self):
+        if not self.mallet_path:
+            return
+        fname = testfile()
+        model = ldamallet.LdaMallet(self.mallet_path, self.corpus, num_topics=2, iterations=100)
+
+        # simulate storing large arrays separately
+        model.save(testfile(), sep_limit=0)
+
+        # test loading the large model arrays with mmap
+        model2 = ldamodel.LdaModel.load(testfile(), mmap='r')
+        self.assertEqual(model.num_topics, model2.num_topics)
+        self.assertTrue(isinstance(model2.wordtopics, numpy.memmap))
+        self.assertTrue(numpy.allclose(model.wordtopics, model2.wordtopics))
+        tstvec = []
+        self.assertTrue(numpy.allclose(model[tstvec], model2[tstvec])) # try projecting an empty vector
+
+    def testLargeMmapCompressed(self):
+        if not self.mallet_path:
+            return
+        fname = testfile() + '.gz'
+        model = ldamallet.LdaMallet(self.mallet_path, self.corpus, num_topics=2, iterations=100)
+
+        # simulate storing large arrays separately
+        model.save(fname, sep_limit=0)
+
+        # test loading the large model arrays with mmap
+        self.assertRaises(IOError, ldamodel.LdaModel.load, fname, mmap='r')
+#endclass TestLdaMallet
 
 
 class TestTfidfModel(unittest.TestCase):
@@ -211,7 +529,7 @@ class TestTfidfModel(unittest.TestCase):
         doc = list(self.corpus)[0]
         transformed = model[doc]
 
-        expected =  [(0, 0.57735026918962573), (1, 0.57735026918962573), (2, 0.57735026918962573)]
+        expected = [(0, 0.57735026918962573), (1, 0.57735026918962573), (2, 0.57735026918962573)]
         self.assertTrue(numpy.allclose(transformed, expected))
 
 
@@ -231,9 +549,19 @@ class TestTfidfModel(unittest.TestCase):
 
 
     def testPersistence(self):
+        fname = testfile()
         model = tfidfmodel.TfidfModel(self.corpus, normalize=True)
-        model.save(testfile())
-        model2 = tfidfmodel.TfidfModel.load(testfile())
+        model.save(fname)
+        model2 = tfidfmodel.TfidfModel.load(fname)
+        self.assertTrue(model.idfs == model2.idfs)
+        tstvec = []
+        self.assertTrue(numpy.allclose(model[tstvec], model2[tstvec])) # try projecting an empty vector
+
+    def testPersistenceCompressed(self):
+        fname = testfile() + '.gz'
+        model = tfidfmodel.TfidfModel(self.corpus, normalize=True)
+        model.save(fname)
+        model2 = tfidfmodel.TfidfModel.load(fname, mmap=None)
         self.assertTrue(model.idfs == model2.idfs)
         tstvec = []
         self.assertTrue(numpy.allclose(model[tstvec], model2[tstvec])) # try projecting an empty vector
@@ -261,9 +589,19 @@ class TestLogEntropyModel(unittest.TestCase):
 
 
     def testPersistence(self):
+        fname = testfile()
         model = logentropy_model.LogEntropyModel(self.corpus_ok, normalize=True)
-        model.save(testfile())
-        model2 = logentropy_model.LogEntropyModel.load(testfile())
+        model.save(fname)
+        model2 = logentropy_model.LogEntropyModel.load(fname)
+        self.assertTrue(model.entr == model2.entr)
+        tstvec = []
+        self.assertTrue(numpy.allclose(model[tstvec], model2[tstvec]))
+
+    def testPersistenceCompressed(self):
+        fname = testfile() + '.gz'
+        model = logentropy_model.LogEntropyModel(self.corpus_ok, normalize=True)
+        model.save(fname)
+        model2 = logentropy_model.LogEntropyModel.load(fname, mmap=None)
         self.assertTrue(model.entr == model2.entr)
         tstvec = []
         self.assertTrue(numpy.allclose(model[tstvec], model2[tstvec]))
@@ -272,5 +610,5 @@ class TestLogEntropyModel(unittest.TestCase):
 
 
 if __name__ == '__main__':
-    logging.root.setLevel(logging.DEBUG)
+    logging.basicConfig(format='%(asctime)s : %(levelname)s : %(message)s', level=logging.DEBUG)
     unittest.main()
